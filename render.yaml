@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: vault-bot
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        value: ""
+        type: secret
+      - key: OWNER_ID
+        value: ""
+      - key: UPLOAD_CHANNEL_ID
+        value: ""
+      - key: DB_CHANNEL_ID
+        value: ""
+      - key: DB_PATH
+        value: "/data/database.sqlite3"
+      - key: JOB_DB_PATH
+        value: "/data/jobs.sqlite"
+      - key: PORT
+        value: "10000"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: BROADCAST_CONCURRENCY
+        value: "12"
