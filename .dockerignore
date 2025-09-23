@@ -3,9 +3,10 @@ __pycache__/
 *.pyo
 *.pyd
 *.db
-*.sqlite3
+*.sqlite
 .env
 .git
 .gitignore
 Dockerfile
 docker-compose.yml
+render.yaml
