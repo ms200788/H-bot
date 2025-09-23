@@ -1,9 +1,23 @@
+# Use official Python runtime
 FROM python:3.11-slim
+
+# Set environment
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Set working directory
 WORKDIR /app
-COPY requirements.txt /app/requirements.txt
+
+# Install dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py /app/bot.py
-ENV PYTHONIOENCODING=UTF-8
-ENV LANG=C.UTF-8
-ENV PORT=10000
-CMD ["python", "bot.py"]
+
+# Copy project files
+COPY . .
+
+# Expose port for healthcheck
+EXPOSE 10000
+
+# Run the bot
+CMD ["python", "telegram_session_vault_bot.py"]
