@@ -2,38 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 VaultBot - Owner upload & deeplink delivery Telegram bot
--------------------------------------------------------
-Features (updated):
- - aiogram-based async Telegram bot (webhook-friendly; fallback to polling)
- - aiohttp health endpoint for Render / UptimeRobot
- - SQLAlchemy ORM (SQLite) for persistent metadata: users, sessions, files, delete jobs, settings
- - APScheduler with SQLAlchemyJobStore for persistent scheduled tasks (delete jobs & periodic DB backup)
- - Owner upload flow: /upload -> send media/text -> /d to finalize (creates session + deep link)
- - Deep links: t.me/<bot_username>?start=<session_id>
- - When a user opens deep link they receive ONLY the session files (photos/videos/documents/text that were added as "text" messages) with their ORIGINAL CAPTIONS — no extra messages, no "Delivery complete" or other metadata.
- - Protect flag prevents forwarding for non-owner receivers (uses protect_content on copy_message). Owner bypasses protect.
- - Auto-delete timer per session: delivered messages in user chat are scheduled for deletion (only removed from users' chats; DB is preserved).
- - Two channels:
-     UPLOAD_CHANNEL: where the bot posts vault copies of owner's uploaded files (file storage)
-     DB_CHANNEL: where the bot uploads/pins SQLite DB backups for restore
- - Automatic DB backup triggers:
-     * Immediately when owner finalizes an upload (/d)
-     * Whenever owner updates settings (setmessage, setimage, setchannel, setforcechannel, setstorage, revoke, del_session)
-     * Periodic backup every 12 hours via APScheduler
- - Automatic DB restore on startup if local DB missing or corrupt
- - Manual restore command /restoredb for owner
- - Dynamic webhook detection for Render via RENDER_EXTERNAL_HOSTNAME; fallback to polling
- - All blocking DB operations are executed in threadpool to avoid blocking event loop
- - Uses aiohttp for a simple /health endpoint so uptime monitors can ping
-
-Deploy files expected:
- - bot.py (this file)
- - requirements.txt (aiogram, aiohttp, apscheduler, SQLAlchemy, python-dotenv)
- - Dockerfile, .dockerignore, render.yaml (examples provided separately)
-
-Notes:
- - Ensure BOT_TOKEN, OWNER_ID and at least UPLOAD_CHANNEL (env or via /setstorage) and DB_CHANNEL (env or via /setstorage) are configured.
- - UPLOAD_CHANNEL and DB_CHANNEL envs may be numeric channel ids (-100...) or links like "https://t.me/channame". If stored as link, the bot will try to resolve to id.
+Full feature set:
+ - Owner upload sessions (/upload ... /d)
+ - Deeplinks t.me/<bot>?start=<session_id> deliver only files with original captions
+ - Upload channel for vaulting files (UPLOAD_CHANNEL_ID)
+ - DB channel for pinned sqlite backups (DB_CHANNEL_ID)
+ - SQLite DB with SQLAlchemy (metadata + jobs)
+ - APScheduler with SQLAlchemyJobStore for persistent scheduled delete jobs + periodic backup
+ - Auto backup whenever owner finalizes upload or updates settings, and periodic every 12 hours
+ - Automatic DB restore from pinned backup on startup and manual /restoredb command for owner
+ - Commands: /start, /help, /setmessage, /setimage, /setchannel, /setforcechannel, /setstorage,
+             /upload, /d, /e, /broadcast, /stats, /list_sessions, /revoke, /backup_db, /restoredb,
+             /del_session, /adminp
+ - Uses aiohttp health endpoint for UptimeRobot/Render
+ - Owner bypasses protect_content when receiving copies
+ - Auto-delete only deletes messages from user chats (DB kept)
 """
 
 import os
@@ -46,9 +29,10 @@ import shutil
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
-# aiogram
+# aiogram imports (v3.x)
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode, ContentType
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from aiogram.enums import ParseMode, ContentType
 from aiogram.utils import exceptions
 from aiogram.utils.executor import start_webhook, start_polling
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -71,7 +55,6 @@ from aiohttp import web
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID") or 0)
 
-# Upload & DB channel environment (may be numeric "-100..." or t.me link)
 UPLOAD_CHANNEL_ENV = os.environ.get("UPLOAD_CHANNEL_ID", "").strip()
 DB_CHANNEL_ENV = os.environ.get("DB_CHANNEL_ID", "").strip()
 
@@ -89,7 +72,6 @@ def parse_env_channel(val: str) -> Optional[int]:
 UPLOAD_CHANNEL_ID = parse_env_channel(UPLOAD_CHANNEL_ENV) or None
 DB_CHANNEL_ID = parse_env_channel(DB_CHANNEL_ENV) or None
 
-# Paths and ports
 DB_PATH = os.environ.get("DB_PATH", "/data/vaultbot.db")
 JOB_DB_PATH = os.environ.get("JOB_DB_PATH", "/data/jobs.sqlite")
 PORT = int(os.environ.get("PORT", os.environ.get("RENDER_INTERNAL_PORT", "8080")))
@@ -99,7 +81,7 @@ BROADCAST_CONCURRENCY = int(os.environ.get("BROADCAST_CONCURRENCY", "12"))
 RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
 MIN_AUTO_DELETE = 0
-MAX_AUTO_DELETE = 10080  # minutes: up to 7 days
+MAX_AUTO_DELETE = 10080  # minutes (7 days)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -177,11 +159,9 @@ class DeleteJob(Base):
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 os.makedirs(os.path.dirname(JOB_DB_PATH), exist_ok=True)
 
-# SQLAlchemy engine & session factory
 ENGINE = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=ENGINE)
 
-# Create tables
 Base.metadata.create_all(bind=ENGINE)
 
 # APScheduler jobstore
@@ -198,7 +178,7 @@ async def run_db(func, *args, **kwargs):
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
 # -------------------------
-# DB sync helper functions (to be executed via run_db)
+# DB sync helper functions
 # -------------------------
 def db_set_sync(key: str, value: str):
     with SessionLocal() as sess:
@@ -416,18 +396,14 @@ async def resolve_channel_link(link: str) -> Optional[int]:
         return None
 
 # -------------------------
-# DB backup & restore (DB channel)
+# DB backup & restore
 # -------------------------
 async def backup_db_to_channel():
     """
     Upload local DB to DB channel and try to pin it.
-    This is called:
-      - when owner finalizes upload (/d)
-      - when owner updates settings (setmessage/setimage/setchannel/setforcechannel/setstorage/revoke/del_session)
-      - periodic every 12 hours
+    Called on owner actions (finalize upload, settings updates) and periodic every 12h.
     """
     try:
-        # determine DB channel id
         db_channel = DB_CHANNEL_ID or await db_get("db_channel")
         if isinstance(db_channel, str):
             resolved = await resolve_channel_link(db_channel)
@@ -462,15 +438,13 @@ async def backup_db_to_channel():
 
 async def restore_db_from_pinned(silent: bool = True) -> bool:
     """
-    If local DB missing or corrupted, attempt to restore from the pinned document in DB channel.
+    Restore DB from the pinned document in DB channel if local DB missing or corrupt.
     Returns True on success.
-    If silent is False, the function will send messages to owner about success/failure.
     """
     global ENGINE, SessionLocal
     try:
-        # If local DB exists and seems fine, do nothing
+        # quick sanity: if DB exists and is OK, skip
         if os.path.exists(DB_PATH):
-            # quick sanity check: can we connect and query settings table?
             try:
                 tmp_engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
                 tmp_conn = tmp_engine.connect()
@@ -480,7 +454,6 @@ async def restore_db_from_pinned(silent: bool = True) -> bool:
                 return True
             except Exception:
                 logger.warning("Local DB exists but appears corrupted; attempting restore from pinned.")
-        # find DB channel
         db_channel = DB_CHANNEL_ID or await db_get("db_channel")
         if isinstance(db_channel, str):
             resolved = await resolve_channel_link(db_channel)
@@ -491,7 +464,6 @@ async def restore_db_from_pinned(silent: bool = True) -> bool:
             if not silent:
                 await safe_send(OWNER_ID, "❌ DB restore failed: DB channel not configured.")
             return False
-        # get pinned message from channel
         try:
             chat = await bot.get_chat(db_channel)
         except exceptions.ChatNotFound:
@@ -502,17 +474,14 @@ async def restore_db_from_pinned(silent: bool = True) -> bool:
         pinned = getattr(chat, "pinned_message", None)
         if pinned and pinned.document:
             file_id = pinned.document.file_id
-            # download file
             tf = tempfile.NamedTemporaryFile(delete=False)
             tmpfile = tf.name
             tf.close()
             file = await bot.get_file(file_id)
             await bot.download_file(file.file_path, tmpfile)
-            # replace local DB
             try:
                 shutil.copy(tmpfile, DB_PATH)
                 logger.info("DB restored from pinned file")
-                # re-init SQLAlchemy engine & sessionmaker to point to restored DB
                 try:
                     ENGINE.dispose()
                 except Exception:
@@ -545,12 +514,9 @@ async def restore_db_from_pinned(silent: bool = True) -> bool:
         return False
 
 # -------------------------
-# Delete job executor & scheduler restore
+# Delete job executor & restore
 # -------------------------
 async def execute_delete_job(job_id:int, job_row:Dict[str,Any]):
-    """
-    Delete messages from a user's chat for a scheduled job. Mark job done afterwards.
-    """
     try:
         msg_ids_field = job_row.get("message_ids")
         msg_ids = json.loads(msg_ids_field) if isinstance(msg_ids_field, str) else msg_ids_field
@@ -613,7 +579,7 @@ async def run_health_app():
     logger.info("Health endpoint running on 0.0.0.0:%s/health", PORT)
 
 # -------------------------
-# Upload session memory (in-memory)
+# Upload session memory
 # -------------------------
 active_uploads: Dict[int, Dict[str,Any]] = {}
 
@@ -632,7 +598,7 @@ def get_upload_messages(owner_id:int) -> List[types.Message]:
     return active_uploads.get(owner_id, {}).get("messages", [])
 
 # -------------------------
-# Buttons & callbacks
+# Buttons & callback factories
 # -------------------------
 cb_choose_protect = CallbackData("protect", "session", "choice")
 cb_retry = CallbackData("retry", "session")
@@ -654,8 +620,7 @@ def build_channel_buttons(optional_list:List[Dict[str,str]], forced_list:List[Di
 async def cmd_start(message: types.Message):
     """
     /start or /start <session_id>
-    When receiving a payload (session_id), deliver only the files of that session to the user —
-    each file with its original caption only (no extra messages).
+    When receiving payload, deliver only files with original captions.
     """
     try:
         await add_or_update_user(message.from_user)
@@ -676,7 +641,6 @@ async def cmd_start(message: types.Message):
             kb = build_channel_buttons(optional, forced)
             await message.answer(start_text, reply_markup=kb)
             return
-        # deliver session files
         try:
             session_id = int(args)
         except Exception:
@@ -686,7 +650,7 @@ async def cmd_start(message: types.Message):
         if not s or s.get("revoked"):
             await message.answer("This session link is invalid or revoked.")
             return
-        # verify forced channels membership if configured
+        # verify forced channels membership
         forced_json = await db_get("force_channels", "[]")
         try:
             forced = json.loads(forced_json)
@@ -740,24 +704,20 @@ async def cmd_start(message: types.Message):
                 vault_chat_id = None
         else:
             vault_chat_id = vault_chat_cfg
-        # Deliver only files (photo/video/document/text) with their original caption. No extra messages.
         for f in files:
             try:
                 ftype = f.get("file_type")
                 caption = f.get("caption") or ""
-                # If file_type is text, send as message with the stored caption (which is the text)
                 if ftype == "text":
                     sent = await bot.send_message(message.chat.id, caption)
                     delivered_ids.append(sent.message_id)
                     continue
-                # For media, prefer copy_message from vault so Telegram stores file, and protect_content param applied.
                 try:
                     protect_content_value = bool(protect_flag) and not owner_is_requester
                     if vault_chat_id and f.get("vault_msg_id"):
                         m = await bot.copy_message(message.chat.id, int(vault_chat_id), f["vault_msg_id"], caption=caption, protect_content=protect_content_value)
                         delivered_ids.append(m.message_id)
                     else:
-                        # fallback: send by file_id directly
                         if ftype == "photo":
                             sent = await bot.send_photo(message.chat.id, f.get("file_id"), caption=caption)
                             delivered_ids.append(sent.message_id)
@@ -771,7 +731,6 @@ async def cmd_start(message: types.Message):
                             sent = await bot.send_message(message.chat.id, caption)
                             delivered_ids.append(sent.message_id)
                 except Exception:
-                    # fallback to direct send by file_id
                     if ftype == "photo":
                         sent = await bot.send_photo(message.chat.id, f.get("file_id"), caption=caption)
                         delivered_ids.append(sent.message_id)
@@ -786,13 +745,11 @@ async def cmd_start(message: types.Message):
                         delivered_ids.append(sent.message_id)
             except Exception:
                 logger.exception("Error delivering file %s for session %s", f.get("id"), session_id)
-        # Schedule auto-delete if configured (only delete from user's chat; DB preserved)
         minutes = int(s.get("auto_delete_minutes") or 0)
         if minutes and delivered_ids:
             run_at = datetime.utcnow() + timedelta(minutes=minutes)
             job_db_id = await add_delete_job(session_id, message.chat.id, delivered_ids, run_at)
             scheduler.add_job(execute_delete_job, 'date', run_date=run_at, args=(job_db_id, {"id": job_db_id, "message_ids": json.dumps(delivered_ids), "target_chat_id": message.chat.id, "run_at": run_at.isoformat()}), id=f"deljob_{job_db_id}")
-        # IMPORTANT: per user's request we do NOT send extra "Delivery complete" messages.
     except Exception:
         logger.exception("Error in /start handler")
         try:
@@ -801,7 +758,7 @@ async def cmd_start(message: types.Message):
             pass
 
 # -------------------------
-# Upload flow (owner)
+# Upload flow for owner
 # -------------------------
 @dp.message_handler(commands=["upload"])
 async def cmd_upload(message: types.Message):
@@ -816,14 +773,14 @@ async def cmd_upload(message: types.Message):
     await message.reply("Upload session started. Send files/text to include. Use /d to finalize or /e to cancel.")
 
 @dp.message_handler(commands=["e"])
-async def cmd_cancel_upload(message: types.Message):
+async def cmd_cancel(message: types.Message):
     if not is_owner(message.from_user.id):
         return
     cancel_upload_session(OWNER_ID)
-    await message.reply("Upload session canceled.")
+    await message.reply("Upload session cancelled.")
 
 @dp.message_handler(commands=["d"])
-async def cmd_finalize_upload(message: types.Message):
+async def cmd_finalize(message: types.Message):
     if not is_owner(message.from_user.id):
         return
     upload = active_uploads.get(OWNER_ID)
@@ -837,7 +794,7 @@ async def cmd_finalize_upload(message: types.Message):
     upload["_finalize_requested"] = True
 
 @dp.callback_query_handler(cb_choose_protect.filter())
-async def _on_choose_protect(call: types.CallbackQuery, callback_data: dict):
+async def choose_protect(call: types.CallbackQuery, callback_data: dict):
     await call.answer()
     try:
         choice = int(callback_data.get("choice", "0"))
@@ -845,12 +802,12 @@ async def _on_choose_protect(call: types.CallbackQuery, callback_data: dict):
             await call.message.answer("Upload session expired.")
             return
         active_uploads[OWNER_ID]["_protect_choice"] = choice
-        await call.message.answer("Enter auto-delete timer in minutes (0-10080). Reply with a number (e.g., 60).")
+        await call.message.answer("Now send auto-delete minutes (0 for none). Reply with an integer between 0 and 10080.")
     except Exception:
-        logger.exception("Error in choose_protect callback")
+        logger.exception("Error in choose_protect")
 
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID and "_finalize_requested" in active_uploads.get(OWNER_ID, {}), content_types=ContentType.TEXT)
-async def _receive_minutes(m: types.Message):
+async def receive_autodel_minutes(m: types.Message):
     try:
         txt = m.text.strip()
         try:
@@ -865,8 +822,7 @@ async def _receive_minutes(m: types.Message):
             await m.reply("Upload session missing.")
             return
         messages: List[types.Message] = upload.get("messages", [])
-        protect = upload.get("_protect_choice", 0)
-        # Determine upload channel id
+        protect = int(upload.get("_protect_choice", 0))
         upload_channel_cfg = UPLOAD_CHANNEL_ID or await db_get("upload_channel")
         if isinstance(upload_channel_cfg, str):
             resolved = await resolve_channel_link(upload_channel_cfg)
@@ -883,7 +839,6 @@ async def _receive_minutes(m: types.Message):
             return
         header_msg_id = header.message_id
         header_chat_id = header.chat.id
-        # Create session record with placeholder deep_link
         session_id = await insert_session(OWNER_ID, bool(protect), mins, "Untitled", header_chat_id, header_msg_id, "")
         me = await bot.get_me()
         deep_link = f"https://t.me/{me.username}?start={session_id}"
@@ -891,10 +846,8 @@ async def _receive_minutes(m: types.Message):
             await bot.edit_message_text(f"Session {session_id}\n{deep_link}", upload_channel, header_msg_id)
         except Exception:
             pass
-        # send/copy each stored message to upload channel and persist metadata
         for msg in messages:
             try:
-                # ignore commands
                 if msg.text and msg.text.strip().startswith("/"):
                     continue
                 if msg.text and (not upload.get("exclude_text")) and not (msg.photo or msg.video or msg.document):
@@ -913,7 +866,6 @@ async def _receive_minutes(m: types.Message):
                     sent = await bot.send_document(upload_channel, file_id, caption=msg.caption or "")
                     await add_file(session_id, "document", file_id, msg.caption or "", msg.message_id, sent.message_id)
                 else:
-                    # fallback: try copy_message
                     try:
                         sent = await bot.copy_message(upload_channel, msg.chat.id, msg.message_id)
                         await add_file(session_id, "other", "", msg.caption or "", msg.message_id, sent.message_id)
@@ -921,7 +873,6 @@ async def _receive_minutes(m: types.Message):
                         logger.exception("Failed to copy message to upload channel during finalize")
             except Exception:
                 logger.exception("Error copying/storing message during finalize")
-        # Update session deep_link and header info synchronously
         def update_deeplink_sync(sid:int, deeplink:str, hm:int, hc:int):
             with SessionLocal() as sess:
                 s = sess.get(SessionModel, sid)
@@ -931,7 +882,6 @@ async def _receive_minutes(m: types.Message):
                     s.header_chat_id = hc
                     sess.commit()
         await run_db(update_deeplink_sync, session_id, deep_link, header_msg_id, header_chat_id)
-        # Automatic backup because owner finalized upload
         try:
             await backup_db_to_channel()
         except Exception:
@@ -963,10 +913,10 @@ async def catch_all_store_uploads(message: types.Message):
                 except Exception:
                     pass
     except Exception:
-        logger.exception("Error in catch_all_store_uploads")
+        logger.exception("Error capturing upload message")
 
 # -------------------------
-# Settings & storage commands (owner)
+# Settings commands
 # -------------------------
 @dp.message_handler(commands=["setmessage"])
 async def cmd_setmessage(message: types.Message):
@@ -983,7 +933,6 @@ async def cmd_setmessage(message: types.Message):
             return
         if message.reply_to_message.text:
             await db_set(f"{target}_text", message.reply_to_message.text)
-            # backup after owner update
             try:
                 await backup_db_to_channel()
             except Exception:
@@ -1126,10 +1075,6 @@ async def cmd_setforcechannel(message: types.Message):
 
 @dp.message_handler(commands=["setstorage"])
 async def cmd_setstorage(message: types.Message):
-    """
-    /setstorage upload <channel_link_or_id>
-    /setstorage db <channel_link_or_id>
-    """
     if not is_owner(message.from_user.id):
         await message.reply("Unauthorized.")
         return
@@ -1163,7 +1108,7 @@ async def cmd_setstorage(message: types.Message):
     await message.reply(f"{which} storage set to {link}")
 
 # -------------------------
-# Help & Admin commands
+# Help & admin
 # -------------------------
 @dp.callback_query_handler(cb_help_button.filter())
 async def cb_help(call: types.CallbackQuery, callback_data: dict):
@@ -1393,7 +1338,6 @@ async def global_error_handler(update, exception):
 # Startup & shutdown
 # -------------------------
 async def on_startup(dispatcher: Dispatcher):
-    # Attempt auto restore if local DB missing or corrupted
     try:
         restored = await restore_db_from_pinned(silent=True)
         if restored:
@@ -1403,29 +1347,24 @@ async def on_startup(dispatcher: Dispatcher):
                 pass
     except Exception:
         logger.exception("Auto restore attempt failed during startup")
-    # Start scheduler
     try:
         scheduler.start()
     except Exception:
         logger.exception("Scheduler start error")
-    # Restore pending delete jobs
     try:
         await restore_pending_jobs_and_schedule()
     except Exception:
         logger.exception("Failed to restore pending delete jobs")
-    # Schedule periodic DB backup every 12 hours (if not already scheduled)
     try:
         if not scheduler.get_job("periodic_db_backup"):
             scheduler.add_job(backup_db_to_channel, 'interval', hours=12, id="periodic_db_backup", next_run_time=datetime.utcnow() + timedelta(seconds=30))
             logger.info("Scheduled periodic DB backup every 12 hours")
     except Exception:
         logger.exception("Failed to schedule periodic DB backup")
-    # Run health app
     try:
         asyncio.create_task(run_health_app())
     except Exception:
         logger.exception("Failed to start health app")
-    # Check channels presence
     if UPLOAD_CHANNEL_ID:
         try:
             await bot.get_chat(UPLOAD_CHANNEL_ID)
@@ -1461,7 +1400,7 @@ async def on_shutdown(dispatcher: Dispatcher):
     await bot.close()
 
 # -------------------------
-# Webhook support & run
+# Webhook & run
 # -------------------------
 def _build_webhook_url() -> Optional[str]:
     path = WEBHOOK_PATH if WEBHOOK_PATH else f"/webhook/{BOT_TOKEN}"
@@ -1509,4 +1448,3 @@ if __name__ == "__main__":
         logger.info("Stopped by user")
     except Exception:
         logger.exception("Fatal error")
-
