@@ -438,37 +438,4 @@ Run
 
 if name == 'main': executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
 
---------------------
-
-requirements.txt
-
---------------------
-
-aiogram==2.25.1
-
-APScheduler==3.10.4
-
-aiohttp==3.8.6
-
-SQLAlchemy==2.0.23
-
---------------------
-
-Dockerfile (example)
-
---------------------
-
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY requirements.txt /app/
-
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY . /app
-
-CMD ["python","bot.py"]
-
-End of file
 
