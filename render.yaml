@@ -1,9 +1,10 @@
 services:
-  - type: web
-    name: telegram-upload-bot
-    env: docker
+  - type: worker
+    name: telegram-session-vault-bot
+    env: python
     plan: free
-    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: python telegram_session_vault_bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -14,13 +15,12 @@ services:
       - key: DB_CHANNEL_ID
         sync: false
       - key: DB_PATH
-        value: /data/database.sqlite3
-      - key: JOB_DB_PATH
-        value: /data/jobs.sqlite
+        value: bot.db
+      - key: BROADCAST_BATCH
+        value: "12"
+      - key: BROADCAST_PAUSE
+        value: "2"
+      - key: HOST
+        value: "0.0.0.0"
       - key: PORT
         value: "10000"
-      - key: LOG_LEVEL
-        value: "INFO"
-    healthCheckPath: /health
-    dockerfilePath: ./Dockerfile
-    autoRestart: true
