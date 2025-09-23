@@ -5,13 +5,7 @@ __pycache__/
 *.db
 *.sqlite3
 .env
-.DS_Store
-Thumbs.db
 .git
 .gitignore
-tests/
-*.log
-*.bak
-*.swp
-*.tmp
-node_modules/
+Dockerfile
+docker-compose.yml
