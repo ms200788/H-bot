@@ -30,10 +30,9 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
 # aiogram imports (v3.x)
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, exceptions
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from aiogram.enums import ParseMode, ContentType
-from aiogram.utils import exceptions
 from aiogram.utils.executor import start_webhook, start_polling
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils.callback_data import CallbackData
