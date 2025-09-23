@@ -20,4 +20,4 @@ COPY . .
 EXPOSE 10000
 
 # Run the bot
-CMD ["python", "telegram_session_vault_bot.py"]
+CMD ["python", "bot.py"]
