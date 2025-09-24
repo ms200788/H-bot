@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # bot.py
 # Vault-style Telegram bot implementing upload sessions, deep links, persistent auto-delete jobs,
@@ -1266,6 +1265,3 @@ if __name__ == "__main__":
         logger.info("Stopped by user")
     except Exception:
         logger.exception("Fatal error")
-
-
-
