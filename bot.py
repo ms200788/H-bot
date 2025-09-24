@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # bot.py
 # Vault-style Telegram bot implementing upload sessions, deep links, persistent auto-delete jobs,
-# DB backups, and admin commands. Webhook mode (aiohttp) for Render deployments.
-# aiogram v2.25.1, aiohttp 3.8.6
+# DB backups, and admin commands.
+# Uses polling + aiohttp health endpoint (suitable for Render, UptimeRobot ping).
+# Works with aiogram 2.25.1, aiohttp 3.8.6, APScheduler 3.10.4, SQLAlchemy 2.x
 
 import os
 import logging
@@ -19,9 +20,11 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from aiogram.dispatcher.handler import CancelHandler
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils.callback_data import CallbackData
+
+# executor for polling
 from aiogram.utils import executor
 
-# exceptions explicitly
+# exceptions from aiogram
 from aiogram.utils.exceptions import (
     BotBlocked,
     ChatNotFound,
@@ -45,13 +48,11 @@ UPLOAD_CHANNEL_ID = int(os.environ.get("UPLOAD_CHANNEL_ID") or 0)
 DB_CHANNEL_ID = int(os.environ.get("DB_CHANNEL_ID") or 0)
 DB_PATH = os.environ.get("DB_PATH", "/data/database.sqlite3")
 JOB_DB_PATH = os.environ.get("JOB_DB_PATH", "/data/jobs.sqlite")
-PORT = int(os.environ.get("PORT", os.environ.get("RENDER_INTERNAL_PORT", "10000")))
+PORT = int(os.environ.get("PORT", "10000"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 BROADCAST_CONCURRENCY = int(os.environ.get("BROADCAST_CONCURRENCY", "12"))
 AUTO_BACKUP_HOURS = int(os.environ.get("AUTO_BACKUP_HOURS", "12"))
-RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "")
 
-# Basic validation
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 if OWNER_ID == 0:
@@ -71,7 +72,6 @@ logger = logging.getLogger("vaultbot")
 # -------------------------
 # Bot & Dispatcher
 # -------------------------
-# We pass parse_mode as string to avoid ParseMode import issues
 bot = Bot(token=BOT_TOKEN, parse_mode='HTML')
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
@@ -455,10 +455,23 @@ async def restore_pending_jobs_and_schedule():
             logger.exception("Failed to restore job %s", job.get("id"))
 
 # -------------------------
-# Health endpoint
+# Health endpoint (aiohttp)
 # -------------------------
 async def handle_health(request):
     return web.Response(text="ok")
+
+async def run_health_app():
+    # starts a separate aiohttp runner on PORT to satisfy uptime checks
+    try:
+        app = web.Application()
+        app.add_routes([web.get('/', handle_health), web.get('/health', handle_health)])
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        await site.start()
+        logger.info("Health endpoint running on 0.0.0.0:%s/health", PORT)
+    except Exception:
+        logger.exception("Failed to start health server")
 
 # -------------------------
 # Utilities for buttons and owner check
@@ -501,6 +514,7 @@ async def cmd_start(message: types.Message):
         if not payload:
             await message.answer(start_text, reply_markup=kb)
             return
+        # payload expected numeric session id
         try:
             session_id = int(payload)
         except Exception:
@@ -555,9 +569,13 @@ async def cmd_start(message: types.Message):
                     delivered_msg_ids.append(m.message_id)
                 else:
                     try:
-                        m = await bot.copy_message(message.chat.id, UPLOAD_CHANNEL_ID, f["vault_msg_id"], caption=f.get("caption") or "", protect_content=bool(protect_flag) and not owner_is_requester)
+                        # owner bypass: owner should get non-protected copies
+                        m = await bot.copy_message(message.chat.id, UPLOAD_CHANNEL_ID, f["vault_msg_id"],
+                                                   caption=f.get("caption") or "",
+                                                   protect_content=bool(protect_flag) and not owner_is_requester)
                         delivered_msg_ids.append(m.message_id)
                     except Exception:
+                        # fallback sending by file_id
                         if f["file_type"] == "photo":
                             sent = await bot.send_photo(message.chat.id, f["file_id"], caption=f.get("caption") or "")
                             delivered_msg_ids.append(sent.message_id)
@@ -567,6 +585,12 @@ async def cmd_start(message: types.Message):
                         elif f["file_type"] == "document":
                             sent = await bot.send_document(message.chat.id, f["file_id"], caption=f.get("caption") or "")
                             delivered_msg_ids.append(sent.message_id)
+                        elif f["file_type"] == "sticker":
+                            try:
+                                sent = await bot.send_sticker(message.chat.id, f["file_id"])
+                                delivered_msg_ids.append(sent.message_id)
+                            except Exception:
+                                pass
                         else:
                             sent = await bot.send_message(message.chat.id, f.get("caption") or "")
                             delivered_msg_ids.append(sent.message_id)
@@ -671,7 +695,7 @@ async def _receive_minutes(m: types.Message):
             try:
                 if m0.text and m0.text.strip().startswith("/"):
                     continue
-                if m0.text and (not upload.get("exclude_text")) and not (m0.photo or m0.video or m0.document):
+                if m0.text and (not upload.get("exclude_text")) and not (m0.photo or m0.video or m0.document or m0.sticker or m0.animation):
                     sent = await bot.send_message(UPLOAD_CHANNEL_ID, m0.text)
                     sql_add_file(session_temp_id, "text", "", m0.text or "", m0.message_id, sent.message_id)
                 elif m0.photo:
@@ -1088,6 +1112,7 @@ async def auto_backup_job():
 
 async def on_startup(dispatcher):
     try:
+        # attempt to restore DB from pinned if missing
         await restore_db_from_pinned()
     except Exception:
         logger.exception("restore_db_from_pinned error on startup")
@@ -1101,9 +1126,18 @@ async def on_startup(dispatcher):
         logger.exception("restore_pending_jobs_and_schedule error")
     try:
         # schedule periodic backups every AUTO_BACKUP_HOURS
-        scheduler.add_job(auto_backup_job, 'interval', hours=AUTO_BACKUP_HOURS, id="auto_backup")
+        # if already scheduled, ignore error
+        try:
+            scheduler.add_job(auto_backup_job, 'interval', hours=AUTO_BACKUP_HOURS, id="auto_backup")
+        except Exception:
+            pass
     except Exception:
         logger.exception("Failed scheduling auto_backup_job")
+    # start health endpoint as background task so Render/UptimeRobot can ping
+    try:
+        asyncio.create_task(run_health_app())
+    except Exception:
+        logger.exception("Failed to start health app task")
     try:
         await bot.get_chat(UPLOAD_CHANNEL_ID)
     except ChatNotFound:
@@ -1133,46 +1167,12 @@ async def on_shutdown(dispatcher):
     await bot.close()
 
 # -------------------------
-# Web app (health) and webhook run
+# Run (polling) - suitable for Render but still exposes health endpoint
 # -------------------------
-def make_web_app():
-    app = web.Application()
-    app.add_routes([web.get('/', handle_health), web.get('/health', handle_health)])
-    return app
-
 if __name__ == "__main__":
-    webhook_path = f"/webhook/{BOT_TOKEN}"
-    webhook_url = f"https://{RENDER_EXTERNAL_HOSTNAME}{webhook_path}" if RENDER_EXTERNAL_HOSTNAME else None
-    web_app = make_web_app()
-
-    async def _on_startup(dispatcher):
-        # set webhook (if hostname provided) and run our startup tasks
-        if webhook_url:
-            try:
-                await bot.set_webhook(webhook_url)
-                logger.info("Webhook set to %s", webhook_url)
-            except Exception:
-                logger.exception("Failed to set webhook to %s", webhook_url)
-        await on_startup(dispatcher)
-
-    async def _on_shutdown(dispatcher):
-        try:
-            await bot.delete_webhook()
-            logger.info("Webhook deleted")
-        except Exception:
-            logger.exception("Failed to delete webhook")
-        await on_shutdown(dispatcher)
-
     try:
-        executor.start_webhook(
-            dispatcher=dp,
-            webhook_path=webhook_path,
-            skip_updates=True,
-            on_startup=_on_startup,
-            on_shutdown=_on_shutdown,
-            host='0.0.0.0',
-            port=PORT,
-            web_app=web_app
-        )
+        executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Stopped by user")
     except Exception:
-        logger.exception("Fatal error when starting webhook")
+        logger.exception("Fatal error")
