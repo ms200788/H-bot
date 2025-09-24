@@ -2,11 +2,9 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.sqlite3
 *.db
-*.sqlite
+/data
 .env
-.git
-.gitignore
-Dockerfile
-docker-compose.yml
-render.yaml
+.vscode
+.idea
