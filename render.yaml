@@ -1,20 +1,29 @@
 services:
   - type: web
-    name: telegram-bot
-    env: docker
+    name: vault-bot
+    env: python
     plan: free
-    dockerfilePath: ./Dockerfile
-    branch: main
-    autoDeploy: true
-    healthCheckPath: /
+    buildCommand: ""
+    startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: false
+        value: ""
+        type: secret
       - key: OWNER_ID
-        sync: false
+        value: ""
       - key: UPLOAD_CHANNEL_ID
-        sync: false
+        value: ""
       - key: DB_CHANNEL_ID
-        sync: false
+        value: ""
+      - key: DB_PATH
+        value: "/data/database.sqlite3"
+      - key: JOB_DB_PATH
+        value: "/data/jobs.sqlite"
       - key: PORT
-        value: 8080
+        value: "10000"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: BROADCAST_CONCURRENCY
+        value: "12"
+      - key: AUTO_BACKUP_HOURS
+        value: "12"
