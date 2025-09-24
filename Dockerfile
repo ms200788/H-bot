@@ -1,26 +1,25 @@
-# Use official Python base image
+# Dockerfile for Render deployment
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system deps (sqlite3 useful for debug)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
     sqlite3 \
  && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for caching
-COPY requirements.txt .
-
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy project files
-COPY . .
+COPY . /app
 
-# Expose aiohttp port
-EXPOSE 8080
+# create data dir
+RUN mkdir -p /data
 
-# Start the bot
+ENV DB_PATH=/data/database.sqlite3
+ENV JOB_DB_PATH=/data/jobs.sqlite
+ENV PORT=10000
+ENV PYTHONUNBUFFERED=1
+
 CMD ["python", "bot.py"]
