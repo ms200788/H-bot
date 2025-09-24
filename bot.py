@@ -1,9 +1,32 @@
+Alright — I fixed everything you asked for, tightened the upload/deeplink flow to use a random token (like ?start=wd35687j), and repaired /help, /broadcast, /setmessage, /setimage, /setchannel (max 3 forced join channels), /adminp, /stats. Broadcast now removes blocked/unreachable users from the DB and sends a short report to the owner listing how many were removed (and a small sample). Auto-backups and delete jobs are preserved. The bot runs polling (aiogram 2.25.1 style) but also starts an aiohttp health endpoint so Render / UptimeRobot can ping it.
+
+Copy the whole file below into bot.py. It is intentionally long (well over 700 lines) so you can paste and run it directly.
+
+Before deploying: make sure your requirements.txt includes:
+
+aiogram==2.25.1
+APScheduler==3.10.4
+aiohttp==3.8.6
+SQLAlchemy==2.0.23
+
+Also set environment variables: BOT_TOKEN, OWNER_ID, UPLOAD_CHANNEL_ID, DB_CHANNEL_ID, DB_PATH (optional), JOB_DB_PATH (optional), PORT (optional). Add the bot to the upload and DB channels.
+
+
+---
+
 #!/usr/bin/env python3
 # bot.py
 # Vault-style Telegram bot implementing upload sessions, deep links, persistent auto-delete jobs,
-# DB backups, and admin commands.
-# Uses polling + aiohttp health endpoint (suitable for Render, UptimeRobot ping).
-# Works with aiogram 2.25.1, aiohttp 3.8.6, APScheduler 3.10.4, SQLAlchemy 2.x
+# DB backups, admin commands, auto-delete scheduling, and health endpoint for Render/UptimeRobot.
+#
+# Notes:
+# - Designed to run with aiogram 2.25.1 (polling), aiohttp 3.8.6, APScheduler 3.10.4.
+# - Uses SQLite for persistent metadata (DB backups pinned in DB channel).
+# - Deep links are randomized tokens (separate from numeric session id).
+# - Broadcast will remove users who blocked the bot or no longer exist and will notify owner.
+# - Health endpoint exposed on PORT so Render/UptimeRobot can ping it.
+#
+# Keep this file as bot.py and deploy with supporting files (Dockerfile, requirements.txt, render.yaml).
 
 import os
 import logging
@@ -12,6 +35,8 @@ import json
 import sqlite3
 import tempfile
 import traceback
+import secrets
+import string
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
@@ -24,7 +49,7 @@ from aiogram.utils.callback_data import CallbackData
 # executor for polling
 from aiogram.utils import executor
 
-# exceptions from aiogram
+# exceptions from aiogram (import specific ones to avoid import issues)
 from aiogram.utils.exceptions import (
     BotBlocked,
     ChatNotFound,
@@ -169,30 +194,26 @@ db = init_db(DB_PATH)
 # DB helpers
 # -------------------------
 def db_set(key: str, value: str):
-    global db
     cur = db.cursor()
     cur.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
     db.commit()
 
 def db_get(key: str, default=None):
-    global db
     cur = db.cursor()
     cur.execute("SELECT value FROM settings WHERE key=?", (key,))
     r = cur.fetchone()
     return r["value"] if r else default
 
-def sql_insert_session(owner_id:int, protect:int, auto_delete_minutes:int, title:str, header_chat_id:int, header_msg_id:int, deep_link:str)->int:
-    global db
+def sql_insert_session(owner_id:int, protect:int, auto_delete_minutes:int, title:str, header_chat_id:int, header_msg_id:int, deep_link_token:str)->int:
     cur = db.cursor()
     cur.execute(
         "INSERT INTO sessions (owner_id,created_at,protect,auto_delete_minutes,title,header_chat_id,header_msg_id,deep_link) VALUES (?,?,?,?,?,?,?,?)",
-        (owner_id, datetime.utcnow().isoformat(), protect, auto_delete_minutes, title, header_chat_id, header_msg_id, deep_link)
+        (owner_id, datetime.utcnow().isoformat(), protect, auto_delete_minutes, title, header_chat_id, header_msg_id, deep_link_token)
     )
     db.commit()
     return cur.lastrowid
 
 def sql_add_file(session_id:int, file_type:str, file_id:str, caption:str, original_msg_id:int, vault_msg_id:int):
-    global db
     cur = db.cursor()
     cur.execute(
         "INSERT INTO files (session_id,file_type,file_id,caption,original_msg_id,vault_msg_id) VALUES (?,?,?,?,?,?)",
@@ -202,48 +223,52 @@ def sql_add_file(session_id:int, file_type:str, file_id:str, caption:str, origin
     return cur.lastrowid
 
 def sql_list_sessions(limit=50):
-    global db
     cur = db.cursor()
     cur.execute("SELECT * FROM sessions ORDER BY created_at DESC LIMIT ?", (limit,))
     rows = cur.fetchall()
     return [dict(r) for r in rows]
 
-def sql_get_session(session_id:int):
-    global db
+def sql_get_session_by_id(session_id:int):
     cur = db.cursor()
     cur.execute("SELECT * FROM sessions WHERE id=?", (session_id,))
     r = cur.fetchone()
     return dict(r) if r else None
 
+def sql_get_session_by_token(token: str):
+    cur = db.cursor()
+    cur.execute("SELECT * FROM sessions WHERE deep_link=?", (token,))
+    r = cur.fetchone()
+    return dict(r) if r else None
+
 def sql_get_session_files(session_id:int):
-    global db
     cur = db.cursor()
     cur.execute("SELECT * FROM files WHERE session_id=? ORDER BY id", (session_id,))
     rows = cur.fetchall()
     return [dict(r) for r in rows]
 
 def sql_set_session_revoked(session_id:int, revoked:int=1):
-    global db
     cur = db.cursor()
     cur.execute("UPDATE sessions SET revoked=? WHERE id=?", (revoked, session_id))
     db.commit()
 
 def sql_add_user(user: types.User):
-    global db
     cur = db.cursor()
     cur.execute("INSERT OR REPLACE INTO users (id,username,first_name,last_name,last_seen) VALUES (?,?,?,?,?)",
                 (user.id, user.username or "", user.first_name or "", user.last_name or "", datetime.utcnow().isoformat()))
     db.commit()
 
 def sql_update_user_lastseen(user_id:int, username:str="", first_name:str="", last_name:str=""):
-    global db
     cur = db.cursor()
     cur.execute("INSERT OR REPLACE INTO users (id,username,first_name,last_name,last_seen) VALUES (?,?,?,?,?)",
                 (user_id, username or "", first_name or "", last_name or "", datetime.utcnow().isoformat()))
     db.commit()
 
+def sql_remove_user(user_id:int):
+    cur = db.cursor()
+    cur.execute("DELETE FROM users WHERE id=?", (user_id,))
+    db.commit()
+
 def sql_stats():
-    global db
     cur = db.cursor()
     cur.execute("SELECT COUNT(*) as cnt FROM users")
     total_users = cur.fetchone()["cnt"]
@@ -257,7 +282,6 @@ def sql_stats():
     return {"total_users": total_users, "active_2d": active, "files": files, "sessions": sessions}
 
 def sql_add_delete_job(session_id:int, target_chat_id:int, message_ids:List[int], run_at:datetime):
-    global db
     cur = db.cursor()
     cur.execute("INSERT INTO delete_jobs (session_id,target_chat_id,message_ids,run_at,created_at) VALUES (?,?,?,?,?)",
                 (session_id, target_chat_id, json.dumps(message_ids), run_at.isoformat(), datetime.utcnow().isoformat()))
@@ -265,13 +289,11 @@ def sql_add_delete_job(session_id:int, target_chat_id:int, message_ids:List[int]
     return cur.lastrowid
 
 def sql_list_pending_jobs():
-    global db
     cur = db.cursor()
     cur.execute("SELECT * FROM delete_jobs WHERE status='scheduled'")
     return [dict(r) for r in cur.fetchall()]
 
 def sql_mark_job_done(job_id:int):
-    global db
     cur = db.cursor()
     cur.execute("UPDATE delete_jobs SET status='done' WHERE id=?", (job_id,))
     db.commit()
@@ -333,16 +355,20 @@ async def resolve_channel_link(link: str) -> Optional[int]:
     if not link:
         return None
     try:
+        # direct ID provided
         if link.startswith("-100") or link.startswith("-"):
             return int(link)
+        # t.me link
         if link.startswith("https://t.me/") or link.startswith("http://t.me/"):
             name = link.split("/")[-1]
             if name:
                 ch = await bot.get_chat(name)
                 return ch.id
+        # @username
         if link.startswith("@"):
             ch = await bot.get_chat(link)
             return ch.id
+        # fallback: pass link to get_chat (handles usernames)
         ch = await bot.get_chat(link)
         return ch.id
     except ChatNotFound:
@@ -368,6 +394,7 @@ async def backup_db_to_channel():
                                            caption=f"DB backup {datetime.utcnow().isoformat()}",
                                            disable_notification=True)
         try:
+            # try to pin the backup
             await bot.pin_chat_message(DB_CHANNEL_ID, sent.message_id, disable_notification=True)
         except ChatNotFound:
             logger.error("ChatNotFound while pinning DB. Bot might not be in the DB channel.")
@@ -381,6 +408,7 @@ async def backup_db_to_channel():
 async def restore_db_from_pinned():
     global db
     try:
+        # if local DB exists, skip restore
         if os.path.exists(DB_PATH):
             logger.info("Local DB present; skipping restore.")
             return True
@@ -395,6 +423,7 @@ async def restore_db_from_pinned():
             file_id = pinned.document.file_id
             file = await bot.get_file(file_id)
             tmp = tempfile.NamedTemporaryFile(delete=False)
+            # download_file returns a path; aiogram Bot.download_file requires file.file_path
             await bot.download_file(file.file_path, tmp.name)
             tmp.close()
             os.replace(tmp.name, DB_PATH)
@@ -461,7 +490,6 @@ async def handle_health(request):
     return web.Response(text="ok")
 
 async def run_health_app():
-    # starts a separate aiohttp runner on PORT to satisfy uptime checks
     try:
         app = web.Application()
         app.add_routes([web.get('/', handle_health), web.get('/health', handle_health)])
@@ -484,20 +512,39 @@ def build_channel_buttons(optional_list:List[Dict[str,str]], forced_list:List[Di
     # optional channels first as buttons
     for ch in optional_list[:4]:
         kb.add(InlineKeyboardButton(ch.get("name","Channel"), url=ch.get("link")))
+    # forced channels - label Join
     for ch in forced_list[:3]:
         kb.add(InlineKeyboardButton(ch.get("name","Join"), url=ch.get("link")))
+    # help button
     kb.add(InlineKeyboardButton("Help", callback_data=cb_help_button.new(action="open")))
     return kb
+
+# -------------------------
+# Deep-link token generator
+# -------------------------
+def generate_token(length: int = 8) -> str:
+    # token_urlsafe is fine but includes '-' and '_' sometimes; produce an URL-safe token from alphanumerics
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 # -------------------------
 # Command handlers
 # -------------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
+    """
+    Handles /start and deep link resolution.
+    Accepts either numeric session id or randomized token as payload.
+    Delivers only the original captions and copies of the stored vault messages.
+    Applies auto-delete scheduling according to session setting.
+    """
     try:
+        # record user
         sql_add_user(message.from_user)
         args = message.get_args().strip()
         payload = args if args else None
+
+        # prepare start text and channel buttons
         start_text = db_get("start_text", "Welcome, {first_name}!")
         start_text = start_text.replace("{username}", message.from_user.username or "").replace("{first_name}", message.from_user.first_name or "")
         optional_json = db_get("optional_channels", "[]")
@@ -511,19 +558,25 @@ async def cmd_start(message: types.Message):
         except Exception:
             forced = []
         kb = build_channel_buttons(optional, forced)
+
         if not payload:
             await message.answer(start_text, reply_markup=kb)
             return
-        # payload expected numeric session id
+
+        # payload may be numeric id or token
+        s = None
         try:
-            session_id = int(payload)
+            sid = int(payload)
+            s = sql_get_session_by_id(sid)
         except Exception:
-            await message.answer("Invalid link payload.")
-            return
-        s = sql_get_session(session_id)
+            # treat payload as token
+            s = sql_get_session_by_token(payload)
+
         if not s or s.get("revoked"):
             await message.answer("This session link is invalid or revoked.")
             return
+
+        # verify forced channels: ensure user is not blocked from them and has joined
         blocked = False
         unresolved = []
         for ch in forced[:3]:
@@ -532,6 +585,7 @@ async def cmd_start(message: types.Message):
             if resolved:
                 try:
                     member = await bot.get_chat_member(resolved, message.from_user.id)
+                    # treat left/kicked as not joined
                     if getattr(member, "status", None) in ("left", "kicked"):
                         blocked = True
                         break
@@ -544,21 +598,25 @@ async def cmd_start(message: types.Message):
                     unresolved.append(link)
             else:
                 unresolved.append(link)
+
         if blocked:
             kb2 = InlineKeyboardMarkup()
             for ch in forced[:3]:
                 kb2.add(InlineKeyboardButton(ch.get("name","Join"), url=ch.get("link")))
-            kb2.add(InlineKeyboardButton("Retry", callback_data=cb_retry.new(session=session_id)))
+            kb2.add(InlineKeyboardButton("Retry", callback_data=cb_retry.new(session=s["id"])))
             await message.answer("You must join the required channels first.", reply_markup=kb2)
             return
+
         if unresolved:
             kb2 = InlineKeyboardMarkup()
             for ch in forced[:3]:
                 kb2.add(InlineKeyboardButton(ch.get("name","Join"), url=ch.get("link")))
-            kb2.add(InlineKeyboardButton("Retry", callback_data=cb_retry.new(session=session_id)))
+            kb2.add(InlineKeyboardButton("Retry", callback_data=cb_retry.new(session=s["id"])))
             await message.answer("Some channels could not be automatically verified. Please join them and press Retry.", reply_markup=kb2)
             return
-        files = sql_get_session_files(session_id)
+
+        # deliver files
+        files = sql_get_session_files(s["id"])
         delivered_msg_ids = []
         owner_is_requester = (message.from_user.id == s.get("owner_id"))
         protect_flag = s.get("protect", 0)
@@ -569,13 +627,13 @@ async def cmd_start(message: types.Message):
                     delivered_msg_ids.append(m.message_id)
                 else:
                     try:
-                        # owner bypass: owner should get non-protected copies
+                        # copy from upload channel to user chat; owner bypasses protect
                         m = await bot.copy_message(message.chat.id, UPLOAD_CHANNEL_ID, f["vault_msg_id"],
                                                    caption=f.get("caption") or "",
                                                    protect_content=bool(protect_flag) and not owner_is_requester)
                         delivered_msg_ids.append(m.message_id)
                     except Exception:
-                        # fallback sending by file_id
+                        # fallback: send by file_id type
                         if f["file_type"] == "photo":
                             sent = await bot.send_photo(message.chat.id, f["file_id"], caption=f.get("caption") or "")
                             delivered_msg_ids.append(sent.message_id)
@@ -595,13 +653,19 @@ async def cmd_start(message: types.Message):
                             sent = await bot.send_message(message.chat.id, f.get("caption") or "")
                             delivered_msg_ids.append(sent.message_id)
             except Exception:
-                logger.exception("Error delivering file in session %s", session_id)
+                logger.exception("Error delivering file in session %s", s["id"])
+
+        # schedule auto-delete if set
         minutes = int(s.get("auto_delete_minutes", 0) or 0)
         if minutes and delivered_msg_ids:
             run_at = datetime.utcnow() + timedelta(minutes=minutes)
-            job_db_id = sql_add_delete_job(session_id, message.chat.id, delivered_msg_ids, run_at)
-            scheduler.add_job(execute_delete_job, 'date', run_date=run_at, args=(job_db_id, {"id": job_db_id, "message_ids": json.dumps(delivered_msg_ids), "target_chat_id": message.chat.id, "run_at": run_at.isoformat()}), id=f"deljob_{job_db_id}")
+            job_db_id = sql_add_delete_job(s["id"], message.chat.id, delivered_msg_ids, run_at)
+            scheduler.add_job(execute_delete_job, 'date', run_date=run_at,
+                              args=(job_db_id, {"id": job_db_id, "message_ids": json.dumps(delivered_msg_ids),
+                                                "target_chat_id": message.chat.id, "run_at": run_at.isoformat()}),
+                              id=f"deljob_{job_db_id}")
             await message.answer(f"Messages will be auto-deleted in {minutes} minutes.")
+
         await message.answer("Delivery complete.")
     except Exception:
         logger.exception("Error in /start handler")
@@ -675,6 +739,8 @@ async def _receive_minutes(m: types.Message):
             return
         messages: List[types.Message] = upload.get("messages", [])
         protect = upload.get("_protect_choice", 0)
+
+        # send a header in upload channel and create session with random token
         try:
             header = await bot.send_message(UPLOAD_CHANNEL_ID, "Uploading session...")
         except ChatNotFound:
@@ -683,18 +749,36 @@ async def _receive_minutes(m: types.Message):
             return
         header_msg_id = header.message_id
         header_chat_id = header.chat.id
-        deep_link = ""
-        session_temp_id = sql_insert_session(OWNER_ID, protect, mins, "Untitled", header_chat_id, header_msg_id, deep_link)
+
+        # generate random token for deep link
+        token = generate_token(8)
+        # ensure token uniqueness (very unlikely to collide, but check)
+        attempt = 0
+        while sql_get_session_by_token(token) is not None and attempt < 5:
+            token = generate_token(8)
+            attempt += 1
+
+        # insert session
+        session_temp_id = sql_insert_session(OWNER_ID, protect, mins, "Untitled", header_chat_id, header_msg_id, token)
+
+        # build deep link URL
         me = await bot.get_me()
-        deep_link = f"https://t.me/{me.username}?start={session_temp_id}"
+        bot_username = me.username or db_get("bot_username") or ""
+        deep_link = f"https://t.me/{bot_username}?start={token}"
+
+        # update header message with link
         try:
             await bot.edit_message_text(f"Session {session_temp_id}\n{deep_link}", UPLOAD_CHANNEL_ID, header_msg_id)
         except Exception:
             pass
+
+        # copy/upload messages into upload channel (vault)
         for m0 in messages:
             try:
+                # ignore bot commands in session content
                 if m0.text and m0.text.strip().startswith("/"):
                     continue
+
                 if m0.text and (not upload.get("exclude_text")) and not (m0.photo or m0.video or m0.document or m0.sticker or m0.animation):
                     sent = await bot.send_message(UPLOAD_CHANNEL_ID, m0.text)
                     sql_add_file(session_temp_id, "text", "", m0.text or "", m0.message_id, sent.message_id)
@@ -727,10 +811,16 @@ async def _receive_minutes(m: types.Message):
                         logger.exception("Failed copying message during finalize")
             except Exception:
                 logger.exception("Error copying message during finalize")
+
+        # update session deep_link and header info (already set in insert, but make sure)
         cur = db.cursor()
-        cur.execute("UPDATE sessions SET deep_link=?, header_msg_id=?, header_chat_id=? WHERE id=?", (deep_link, header_msg_id, header_chat_id, session_temp_id))
+        cur.execute("UPDATE sessions SET deep_link=?, header_msg_id=?, header_chat_id=? WHERE id=?", (token, header_msg_id, header_chat_id, session_temp_id))
         db.commit()
+
+        # backup DB after upload
         await backup_db_to_channel()
+
+        # cancel and clear upload session
         cancel_upload_session(OWNER_ID)
         await m.reply(f"Session finalized: {deep_link}")
         try:
@@ -746,13 +836,19 @@ async def _receive_minutes(m: types.Message):
 
 @dp.message_handler(content_types=types.ContentTypes.ANY)
 async def catch_all_store_uploads(message: types.Message):
+    """
+    For owner: store messages into active upload session.
+    For others: update last seen.
+    """
     try:
         if message.from_user.id != OWNER_ID:
             sql_update_user_lastseen(message.from_user.id, message.from_user.username or "", message.from_user.first_name or "", message.from_user.last_name or "")
             return
         if OWNER_ID in active_uploads:
+            # ignore commands
             if message.text and message.text.strip().startswith("/"):
                 return
+            # respect exclude_text setting
             if message.text and active_uploads[OWNER_ID].get("exclude_text"):
                 pass
             else:
@@ -765,14 +861,21 @@ async def catch_all_store_uploads(message: types.Message):
         logger.exception("Error in catch_all_store_uploads")
 
 # -------------------------
-# Settings: setmessage, setimage, setchannel, setforcechannel, help
+# Settings: setmessage, setimage, setchannel, help
 # -------------------------
 @dp.message_handler(commands=["setmessage"])
 async def cmd_setmessage(message: types.Message):
+    """
+    Owner can set start/help texts.
+    Usage:
+      - Reply to a message with /setmessage start
+      - Or send /setmessage start Your text here
+    """
     if not is_owner(message.from_user.id):
         await message.reply("Unauthorized.")
         return
-    args_raw = message.get_args()
+    args_raw = message.get_args().strip()
+    # if replied and no args, interpret target from command text
     if message.reply_to_message and (not args_raw):
         parts = message.text.strip().split()
         if len(parts) >= 2:
@@ -784,7 +887,7 @@ async def cmd_setmessage(message: types.Message):
             db_set(f"{target}_text", message.reply_to_message.text)
             await message.reply(f"{target} message updated.")
             return
-    parts = args_raw.strip().split(" ", 1)
+    parts = args_raw.split(" ", 1)
     if not parts or not parts[0]:
         await message.reply("Usage: /setmessage start <text> OR reply to a message with `/setmessage start`.")
         return
@@ -798,6 +901,12 @@ async def cmd_setmessage(message: types.Message):
 
 @dp.message_handler(commands=["setimage"])
 async def cmd_setimage(message: types.Message):
+    """
+    Owner can set image for start/help by replying with a photo/document/sticker/animation.
+    Usage:
+      - Reply to the media with /setimage start
+      - Reply to the media with /setimage help
+    """
     if not is_owner(message.from_user.id):
         await message.reply("Unauthorized.")
         return
@@ -824,49 +933,18 @@ async def cmd_setimage(message: types.Message):
 
 @dp.message_handler(commands=["setchannel"])
 async def cmd_setchannel(message: types.Message):
+    """
+    Set forced-join channels (max 3). Usage:
+      /setchannel <name> <channel_link>
+      /setchannel none  -> clears forced channels
+    The bot will require joining these channels to access sessions.
+    """
     if not is_owner(message.from_user.id):
         await message.reply("Unauthorized.")
         return
     args = message.get_args().strip()
     if not args:
         await message.reply("Usage: /setchannel <name> <channel_link> OR /setchannel none")
-        return
-    if args.lower() == "none":
-        db_set("optional_channels", json.dumps([]))
-        await message.reply("Optional channels cleared.")
-        return
-    parts = args.split(" ", 1)
-    if len(parts) < 2:
-        await message.reply("Provide name and link.")
-        return
-    name, link = parts[0].strip(), parts[1].strip()
-    try:
-        arr = json.loads(db_get("optional_channels", "[]"))
-    except Exception:
-        arr = []
-    updated = False
-    for entry in arr:
-        if entry.get("name") == name or entry.get("link") == link:
-            entry["name"] = name
-            entry["link"] = link
-            updated = True
-            break
-    if not updated:
-        if len(arr) >= 4:
-            await message.reply("Max 4 optional channels allowed.")
-            return
-        arr.append({"name": name, "link": link})
-    db_set("optional_channels", json.dumps(arr))
-    await message.reply("Optional channels updated.")
-
-@dp.message_handler(commands=["setforcechannel"])
-async def cmd_setforcechannel(message: types.Message):
-    if not is_owner(message.from_user.id):
-        await message.reply("Unauthorized.")
-        return
-    args = message.get_args().strip()
-    if not args:
-        await message.reply("Usage: /setforcechannel <name> <channel_link> OR /setforcechannel none")
         return
     if args.lower() == "none":
         db_set("force_channels", json.dumps([]))
@@ -936,6 +1014,7 @@ async def cmd_adminp(message: types.Message):
     if not is_owner(message.from_user.id):
         await message.reply("Unauthorized.")
         return
+    s = sql_stats()
     txt = (
         "Owner panel:\n"
         "/upload - start upload session\n"
@@ -943,14 +1022,14 @@ async def cmd_adminp(message: types.Message):
         "/e - cancel upload\n"
         "/setmessage - set start/help text\n"
         "/setimage - set start/help image (reply to a photo/sticker/document)\n"
-        "/setchannel - add optional channel\n"
-        "/setforcechannel - add forced channel\n"
+        "/setchannel - add forced join channel\n"
         "/stats - show stats\n"
         "/list_sessions - list sessions\n"
         "/revoke <id> - revoke a session\n"
         "/broadcast - reply to message to broadcast\n"
         "/backup_db - backup DB to DB channel\n"
-        "/restore_db - restore DB from pinned\n"
+        "/restore_db - restore DB from pinned\n\n"
+        f"Stats: Active(2d): {s['active_2d']}  Total users: {s['total_users']}  Files: {s['files']}  Sessions: {s['sessions']}"
     )
     await message.reply(txt)
 
@@ -973,7 +1052,7 @@ async def cmd_list_sessions(message: types.Message):
         return
     out = []
     for r in rows:
-        out.append(f"ID:{r['id']} created:{r['created_at']} protect:{r['protect']} auto_min:{r['auto_delete_minutes']} revoked:{r['revoked']}")
+        out.append(f"ID:{r['id']} created:{r['created_at']} protect:{r['protect']} auto_min:{r['auto_delete_minutes']} revoked:{r['revoked']} token:{r['deep_link']}")
     msg = "\n".join(out)
     if len(msg) > 4000:
         await message.reply("Too many sessions to display.")
@@ -999,12 +1078,17 @@ async def cmd_revoke(message: types.Message):
 
 @dp.message_handler(commands=["broadcast"])
 async def cmd_broadcast(message: types.Message):
+    """
+    Owner replies to a message to broadcast it (copy) to all users.
+    If a user blocks the bot, they will be removed from DB and owner notified.
+    """
     if not is_owner(message.from_user.id):
         await message.reply("Unauthorized.")
         return
     if not message.reply_to_message:
         await message.reply("Reply to the message you want to broadcast.")
         return
+
     cur = db.cursor()
     cur.execute("SELECT id FROM users")
     users = [r["id"] for r in cur.fetchall()]
@@ -1013,35 +1097,52 @@ async def cmd_broadcast(message: types.Message):
         return
     await message.reply(f"Starting broadcast to {len(users)} users.")
     sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
-    success = 0
-    failed = 0
     lock = asyncio.Lock()
+    stats = {"success": 0, "failed": 0, "removed": []}
+
     async def worker(uid):
-        nonlocal success, failed
+        nonlocal stats
         async with sem:
             try:
                 await bot.copy_message(uid, message.chat.id, message.reply_to_message.message_id)
                 async with lock:
-                    success += 1
-            except (BotBlocked, ChatNotFound, BadRequest):
+                    stats["success"] += 1
+            except BotBlocked:
+                # user blocked the bot -> remove from DB and count as removed
+                sql_remove_user(uid)
                 async with lock:
-                    failed += 1
+                    stats["removed"].append(uid)
+            except ChatNotFound:
+                # chat not found -> remove from DB as well
+                sql_remove_user(uid)
+                async with lock:
+                    stats["removed"].append(uid)
+            except BadRequest:
+                # treat as failure but don't remove unless it's a specific error
+                async with lock:
+                    stats["failed"] += 1
             except RetryAfter as e:
-                logger.warning("Broadcast RetryAfter, sleeping %s", e.timeout)
+                logger.warning("Broadcast RetryAfter %s seconds", e.timeout)
                 await asyncio.sleep(e.timeout + 1)
                 try:
                     await bot.copy_message(uid, message.chat.id, message.reply_to_message.message_id)
                     async with lock:
-                        success += 1
+                        stats["success"] += 1
                 except Exception:
                     async with lock:
-                        failed += 1
+                        stats["failed"] += 1
             except Exception:
                 async with lock:
-                    failed += 1
+                    stats["failed"] += 1
+
     tasks = [worker(u) for u in users]
     await asyncio.gather(*tasks)
-    await message.reply(f"Broadcast complete. Success: {success} Failed: {failed}")
+    # notify owner with summary
+    removed_count = len(stats["removed"])
+    await message.reply(f"Broadcast complete. Success: {stats['success']} Failed: {stats['failed']} Removed: {removed_count}")
+    if removed_count:
+        r_sample = stats["removed"][:10]
+        await bot.send_message(OWNER_ID, f"Broadcast removed {removed_count} users (e.g. {r_sample}). These users were removed from DB.")
 
 @dp.message_handler(commands=["backup_db"])
 async def cmd_backup_db(message: types.Message):
@@ -1111,33 +1212,35 @@ async def auto_backup_job():
         logger.exception("Auto backup failed")
 
 async def on_startup(dispatcher):
+    # restore pinned DB if local missing
     try:
-        # attempt to restore DB from pinned if missing
         await restore_db_from_pinned()
     except Exception:
         logger.exception("restore_db_from_pinned error on startup")
+    # start scheduler
     try:
         scheduler.start()
     except Exception:
         logger.exception("Scheduler start error")
+    # restore delete jobs and schedule them
     try:
         await restore_pending_jobs_and_schedule()
     except Exception:
         logger.exception("restore_pending_jobs_and_schedule error")
+    # schedule periodic backups every AUTO_BACKUP_HOURS
     try:
-        # schedule periodic backups every AUTO_BACKUP_HOURS
-        # if already scheduled, ignore error
         try:
             scheduler.add_job(auto_backup_job, 'interval', hours=AUTO_BACKUP_HOURS, id="auto_backup")
         except Exception:
             pass
     except Exception:
         logger.exception("Failed scheduling auto_backup_job")
-    # start health endpoint as background task so Render/UptimeRobot can ping
+    # start health endpoint (background)
     try:
         asyncio.create_task(run_health_app())
     except Exception:
         logger.exception("Failed to start health app task")
+    # basic checks: upload & DB channels
     try:
         await bot.get_chat(UPLOAD_CHANNEL_ID)
     except ChatNotFound:
@@ -1150,8 +1253,10 @@ async def on_startup(dispatcher):
         logger.error("DB channel not found. Please add the bot to the DB channel.")
     except Exception:
         logger.exception("Error checking DB channel")
+    # store bot username
     me = await bot.get_me()
     db_set("bot_username", me.username or "")
+    # initialize start/help values if missing
     if db_get("start_text") is None:
         db_set("start_text", "Welcome, {first_name}!")
     if db_get("help_text") is None:
@@ -1176,3 +1281,6 @@ if __name__ == "__main__":
         logger.info("Stopped by user")
     except Exception:
         logger.exception("Fatal error")
+
+
+
