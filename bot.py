@@ -1,18 +1,3 @@
-Alright — I fixed everything you asked for, tightened the upload/deeplink flow to use a random token (like ?start=wd35687j), and repaired /help, /broadcast, /setmessage, /setimage, /setchannel (max 3 forced join channels), /adminp, /stats. Broadcast now removes blocked/unreachable users from the DB and sends a short report to the owner listing how many were removed (and a small sample). Auto-backups and delete jobs are preserved. The bot runs polling (aiogram 2.25.1 style) but also starts an aiohttp health endpoint so Render / UptimeRobot can ping it.
-
-Copy the whole file below into bot.py. It is intentionally long (well over 700 lines) so you can paste and run it directly.
-
-Before deploying: make sure your requirements.txt includes:
-
-aiogram==2.25.1
-APScheduler==3.10.4
-aiohttp==3.8.6
-SQLAlchemy==2.0.23
-
-Also set environment variables: BOT_TOKEN, OWNER_ID, UPLOAD_CHANNEL_ID, DB_CHANNEL_ID, DB_PATH (optional), JOB_DB_PATH (optional), PORT (optional). Add the bot to the upload and DB channels.
-
-
----
 
 #!/usr/bin/env python3
 # bot.py
